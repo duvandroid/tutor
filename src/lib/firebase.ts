@@ -1,13 +1,14 @@
 import { initializeApp } from 'firebase/app';
 import {
   getAuth,
-  sendSignInLinkToEmail,
-  isSignInWithEmailLink,
-  signInWithEmailLink,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  sendPasswordResetEmail,
   onAuthStateChanged,
   signOut,
   type User,
 } from 'firebase/auth';
+import { getFirestore } from 'firebase/firestore';
 
 const firebaseConfig = {
   apiKey: 'AIzaSyAh6cDzd2atM_VjPO5qd6F8KspUQKUmmVM',
@@ -20,6 +21,7 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
+export const db = getFirestore(app);
 
 const SESSION_KEY = 'claudia_session_ts';
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 1 day
@@ -36,35 +38,22 @@ export const startSession = () => {
 
 export const clearSession = () => {
   localStorage.removeItem(SESSION_KEY);
-  localStorage.removeItem('emailForSignIn');
 };
 
-export const sendVerificationLink = async (email: string) => {
-  const actionCodeSettings = {
-    url: window.location.origin,
-    handleCodeInApp: true,
-  };
-  await sendSignInLinkToEmail(auth, email, actionCodeSettings);
-  localStorage.setItem('emailForSignIn', email);
-};
-
-export const completeSignIn = async (): Promise<User | null> => {
-  if (!isSignInWithEmailLink(auth, window.location.href)) return null;
-
-  let email = localStorage.getItem('emailForSignIn');
-  if (!email) {
-    email = window.prompt('Por favor confirma tu correo electrónico:');
-  }
-  if (!email) return null;
-
-  const result = await signInWithEmailLink(auth, email, window.location.href);
-  localStorage.removeItem('emailForSignIn');
+export const signUp = async (email: string, password: string): Promise<User> => {
+  const result = await createUserWithEmailAndPassword(auth, email, password);
   startSession();
-
-  // Clean up URL
-  window.history.replaceState(null, '', window.location.origin);
-
   return result.user;
+};
+
+export const signIn = async (email: string, password: string): Promise<User> => {
+  const result = await signInWithEmailAndPassword(auth, email, password);
+  startSession();
+  return result.user;
+};
+
+export const resetPassword = async (email: string) => {
+  await sendPasswordResetEmail(auth, email);
 };
 
 export const logout = async () => {

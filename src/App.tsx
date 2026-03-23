@@ -4,10 +4,18 @@ import {
   Phone, PhoneOff, Loader2, Send, Paperclip, X, FileText,
   Image as ImageIcon, GraduationCap, ClipboardList, Sparkles,
   Settings, Check, CircleCheck, CircleX, Circle, Trophy, Target,
-  ChevronDown, ChevronUp, LogOut,
+  ChevronDown, ChevronUp,
 } from 'lucide-react';
 import Markdown from 'react-markdown';
 import { AudioRecorder, AudioPlayer } from './lib/audio';
+import {
+  createConversation,
+  addMessage,
+  getConversationMessages,
+  autoTitleConversation,
+  updateConversationTopic,
+  trackAudioCall,
+} from './lib/firestore';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -156,11 +164,14 @@ type Message = {
 };
 
 type AppProps = {
-  user: { email: string | null; displayName: string | null };
+  user: { uid: string; email: string | null; displayName: string | null };
   onLogout: () => void;
+  conversationId: string | null;
+  onConversationCreated: (id: string) => void;
+  onMessagesChanged: () => Promise<void>;
 };
 
-export default function App({ user, onLogout }: AppProps) {
+export default function App({ user, onLogout, conversationId, onConversationCreated, onMessagesChanged }: AppProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -190,6 +201,42 @@ export default function App({ user, onLogout }: AppProps) {
   const [quizAnswers, setQuizAnswers] = useState<Record<string, Record<number, number>>>({});
   const [quizSubmitted, setQuizSubmitted] = useState<Record<string, boolean>>({});
   const [expandedExplanations, setExpandedExplanations] = useState<Record<string, boolean>>({});
+  const currentConvIdRef = useRef<string | null>(conversationId);
+
+  // Load existing conversation messages
+  useEffect(() => {
+    currentConvIdRef.current = conversationId;
+    if (conversationId) {
+      setMessages([]);
+      historyRef.current = [];
+      setMessagesSent(0);
+      getConversationMessages(conversationId).then((msgs) => {
+        if (currentConvIdRef.current !== conversationId) return;
+        const loaded: Message[] = msgs.map((m) => ({
+          role: m.role,
+          text: m.text,
+          files: m.files,
+          quiz: m.quiz,
+        }));
+        setMessages(loaded);
+        // Rebuild history for Gemini context
+        historyRef.current = msgs.map((m) => ({
+          role: m.role,
+          parts: [{ text: m.text || (m.quiz ? JSON.stringify(m.quiz) : '') }],
+        }));
+        setMessagesSent(msgs.filter((m) => m.role === 'user').length);
+      });
+    } else {
+      // New chat — reset state
+      setMessages([]);
+      historyRef.current = [];
+      setMessagesSent(0);
+      setTopic('');
+      setQuizAnswers({});
+      setQuizSubmitted({});
+      setExpandedExplanations({});
+    }
+  }, [conversationId]);
 
   useEffect(() => {
     if (chatRef.current) {
@@ -297,6 +344,23 @@ export default function App({ user, onLogout }: AppProps) {
     const wantsQuiz = QUIZ_KEYWORDS.test(text);
 
     try {
+      // Create conversation in Firestore if this is the first message
+      let convId = currentConvIdRef.current;
+      if (!convId) {
+        convId = await createConversation(user.uid, topic);
+        currentConvIdRef.current = convId;
+        onConversationCreated(convId);
+        // Auto-title from first message
+        await autoTitleConversation(convId, userMsg.text);
+      }
+
+      // Save user message to Firestore
+      await addMessage(convId, user.uid, {
+        role: 'user',
+        text: userMsg.text,
+        files: userMsg.files?.map((f) => ({ name: f.name, type: f.type })),
+      });
+
       const parts: Part[] = [];
 
       for (const file of attachedFiles) {
@@ -337,8 +401,11 @@ export default function App({ user, onLogout }: AppProps) {
         try {
           const quiz = JSON.parse(responseText) as Quiz;
           setMessages((prev) => [...prev, { role: 'model', text: '', quiz }]);
+          // Save model quiz response to Firestore
+          await addMessage(convId, user.uid, { role: 'model', text: '', quiz });
         } catch {
           setMessages((prev) => [...prev, { role: 'model', text: 'No pude generar el quiz. Inténtalo de nuevo.' }]);
+          await addMessage(convId, user.uid, { role: 'model', text: 'No pude generar el quiz. Inténtalo de nuevo.' });
         }
       } else {
         // Normal text response
@@ -353,7 +420,12 @@ export default function App({ user, onLogout }: AppProps) {
         const responseText = result.text ?? 'No pude generar una respuesta.';
         historyRef.current.push({ role: 'model', parts: [{ text: responseText }] });
         setMessages((prev) => [...prev, { role: 'model', text: responseText }]);
+        // Save model response to Firestore
+        await addMessage(convId, user.uid, { role: 'model', text: responseText });
       }
+
+      // Refresh sidebar conversation list
+      onMessagesChanged();
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'Error al procesar tu mensaje.');
@@ -465,6 +537,9 @@ export default function App({ user, onLogout }: AppProps) {
 
       const contextSummary = buildConversationContext();
 
+      // Track audio call in Firestore
+      trackAudioCall(user.uid);
+
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         callbacks: {
@@ -548,6 +623,10 @@ export default function App({ user, onLogout }: AppProps) {
     setTopic(t);
     setShowTopicPicker(false);
     setCustomTopic('');
+    // Update topic in Firestore if conversation exists
+    if (currentConvIdRef.current) {
+      updateConversationTopic(currentConvIdRef.current, t);
+    }
   };
 
   const handleCustomTopic = () => {
@@ -627,12 +706,20 @@ export default function App({ user, onLogout }: AppProps) {
 
     const summary = `Resultado: ${correct}/${total} en "${quiz.title}".\n\n${details}\n\nAnaliza mis resultados, felicítame por las correctas, explica las que fallé y recomiéndame en qué enfocarme.`;
 
+    const quizResultText = `Obtuve ${correct}/${total} en el quiz.`;
+
     // Auto-send
-    setMessages((prev) => [...prev, { role: 'user', text: `Obtuve ${correct}/${total} en el quiz.` }]);
+    setMessages((prev) => [...prev, { role: 'user', text: quizResultText }]);
     setIsLoading(true);
     setError(null);
 
     try {
+      // Save quiz result message to Firestore
+      const convId = currentConvIdRef.current;
+      if (convId) {
+        await addMessage(convId, user.uid, { role: 'user', text: quizResultText });
+      }
+
       historyRef.current.push({ role: 'user', parts: [{ text: summary }] });
 
       const result = await ai.models.generateContent({
@@ -644,6 +731,11 @@ export default function App({ user, onLogout }: AppProps) {
       const responseText = result.text ?? 'No pude analizar tus resultados.';
       historyRef.current.push({ role: 'model', parts: [{ text: responseText }] });
       setMessages((prev) => [...prev, { role: 'model', text: responseText }]);
+
+      // Save model response to Firestore
+      if (convId) {
+        await addMessage(convId, user.uid, { role: 'model', text: responseText });
+      }
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'Error al analizar resultados.');
@@ -874,25 +966,27 @@ export default function App({ user, onLogout }: AppProps) {
 
   return (
     <div
-      className="h-dvh bg-stone-100 flex flex-col font-sans text-stone-900"
+      className="flex-1 h-dvh bg-stone-100 flex flex-col font-sans text-stone-900 min-w-0"
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       {/* Header */}
       <header className="bg-white border-b border-stone-200 px-4 py-3 flex items-center gap-3 shrink-0">
-        <div className="w-10 h-10 bg-rose-100 rounded-full flex items-center justify-center">
-          <GraduationCap className="w-5 h-5 text-rose-600" />
-        </div>
-        <div className="flex-1 min-w-0">
-          <h1 className="text-lg font-bold leading-tight">Claudia</h1>
-          <button
-            onClick={() => setShowTopicPicker(!showTopicPicker)}
-            className="text-xs text-stone-400 hover:text-rose-500 transition-colors flex items-center gap-1"
-          >
-            <Settings className="w-3 h-3" />
-            {topic || 'Elige una materia'}
-          </button>
+        <div className="pl-10 lg:pl-0 flex-1 min-w-0 flex items-center gap-3">
+          <div className="w-10 h-10 bg-rose-100 rounded-full flex items-center justify-center shrink-0">
+            <GraduationCap className="w-5 h-5 text-rose-600" />
+          </div>
+          <div>
+            <h1 className="text-lg font-bold leading-tight">Claudia</h1>
+            <button
+              onClick={() => setShowTopicPicker(!showTopicPicker)}
+              className="text-xs text-stone-400 hover:text-rose-500 transition-colors flex items-center gap-1"
+            >
+              <Settings className="w-3 h-3" />
+              {topic || 'Elige una materia'}
+            </button>
+          </div>
         </div>
         <button
           onClick={isConnected ? disconnect : connect}
@@ -913,13 +1007,6 @@ export default function App({ user, onLogout }: AppProps) {
           ) : (
             <PhoneOff className="w-5 h-5 text-white" />
           )}
-        </button>
-        <button
-          onClick={onLogout}
-          className="w-10 h-10 rounded-full bg-stone-100 hover:bg-stone-200 flex items-center justify-center transition-colors"
-          title="Cerrar sesión"
-        >
-          <LogOut className="w-4 h-4 text-stone-500" />
         </button>
       </header>
 

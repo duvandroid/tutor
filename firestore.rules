@@ -1,0 +1,41 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Users: can read/write own profile, admins can read all
+    match /users/{userId} {
+      allow read: if request.auth != null && (
+        request.auth.uid == userId ||
+        request.auth.token.email == 'duvandroid@gmail.com'
+      );
+      allow create: if request.auth != null && request.auth.uid == userId;
+      allow update: if request.auth != null && (
+        request.auth.uid == userId ||
+        request.auth.token.email == 'duvandroid@gmail.com'
+      );
+    }
+
+    // Conversations: users can CRUD their own, admins can read all
+    match /conversations/{convId} {
+      allow read: if request.auth != null && (
+        resource.data.userId == request.auth.uid ||
+        request.auth.token.email == 'duvandroid@gmail.com'
+      );
+      allow create: if request.auth != null && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if request.auth != null && (
+        resource.data.userId == request.auth.uid
+      );
+
+      // Messages subcollection
+      match /messages/{msgId} {
+        allow read, create: if request.auth != null && (
+          get(/databases/$(database)/documents/conversations/$(convId)).data.userId == request.auth.uid ||
+          request.auth.token.email == 'duvandroid@gmail.com'
+        );
+        allow delete: if request.auth != null &&
+          get(/databases/$(database)/documents/conversations/$(convId)).data.userId == request.auth.uid;
+      }
+    }
+  }
+}

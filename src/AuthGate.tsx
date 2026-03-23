@@ -1,65 +1,36 @@
 import { useState, useEffect } from 'react';
 import { Loader2 } from 'lucide-react';
-import App from './App';
+import Layout from './Layout';
 import Login from './Login';
 import {
   auth,
   onAuthStateChanged,
   isSessionValid,
-  completeSignIn,
   startSession,
   logout,
   type User,
 } from './lib/firebase';
-import { isSignInWithEmailLink } from 'firebase/auth';
 
 export default function AuthGate() {
   const [user, setUser] = useState<User | null>(null);
   const [checking, setChecking] = useState(true);
 
   useEffect(() => {
-    let cancelled = false;
-
-    const init = async () => {
-      // Step 1: If returning from email link, complete sign-in FIRST
-      if (isSignInWithEmailLink(auth, window.location.href)) {
-        try {
-          const u = await completeSignIn();
-          if (!cancelled && u) {
-            setUser(u);
-            setChecking(false);
-            return; // done — skip onAuthStateChanged initial check
-          }
-        } catch (err) {
-          console.error('Sign-in link error:', err);
-        }
+    const unsub = onAuthStateChanged(auth, (u) => {
+      if (u && isSessionValid()) {
+        setUser(u);
+      } else if (u && !isSessionValid()) {
+        // Firebase still has a session but our 24h window expired
+        // Re-start the session since user is already authenticated
+        startSession();
+        setUser(u);
+      } else {
+        setUser(null);
       }
+      setChecking(false);
+    });
 
-      // Step 2: Listen for auth state (normal flow / already signed in)
-      const unsub = onAuthStateChanged(auth, (u) => {
-        if (cancelled) return;
-        if (u && isSessionValid()) {
-          setUser(u);
-        } else if (u) {
-          // Signed in but session expired
-          logout();
-          setUser(null);
-        } else {
-          setUser(null);
-        }
-        setChecking(false);
-      });
-
-      return unsub;
-    };
-
-    let unsub: (() => void) | undefined;
-    init().then((u) => { unsub = u; });
-
-    return () => {
-      cancelled = true;
-      unsub?.();
-    };
+    return () => unsub();
   }, []);
 
   if (checking) {
@@ -72,5 +43,5 @@ export default function AuthGate() {
 
   if (!user) return <Login />;
 
-  return <App user={user} onLogout={logout} />;
+  return <Layout user={user} onLogout={logout} />;
 }
