@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(firebase auth:import --project claudia-tutor /dev/null)",
+      "Bash(gcloud services:*)"
+    ]
+  }
+}

@@ -4,12 +4,20 @@ import {
   Phone, PhoneOff, Loader2, Send, Paperclip, X, FileText,
   Image as ImageIcon, GraduationCap, ClipboardList, Sparkles,
   Settings, Check, CircleCheck, CircleX, Circle, Trophy, Target,
-  ChevronDown, ChevronUp,
+  ChevronDown, ChevronUp, LogOut,
 } from 'lucide-react';
 import Markdown from 'react-markdown';
 import { AudioRecorder, AudioPlayer } from './lib/audio';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// === LIMITS ===
+const MAX_INPUT_CHARS = 2000;         // Max characters per text message
+const MAX_FILES_PER_MESSAGE = 3;      // Max files attached at once
+const MAX_FILE_SIZE_MB = 10;          // Max size per file in MB
+const MAX_HISTORY_TURNS = 20;         // Max conversation turns sent to Gemini (keeps last N)
+const LIVE_SESSION_TIMEOUT_MS = 5 * 60 * 1000; // Auto-disconnect live after 5 min
+const MAX_MESSAGES_PER_SESSION = 30;  // Max text messages per session (user messages only)
 
 const SUPPORTED_TYPES = [
   'image/*',
@@ -147,7 +155,12 @@ type Message = {
   quiz?: Quiz;
 };
 
-export default function App() {
+type AppProps = {
+  user: { email: string | null; displayName: string | null };
+  onLogout: () => void;
+};
+
+export default function App({ user, onLogout }: AppProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -162,9 +175,13 @@ export default function App() {
   // Audio state
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [liveSecondsLeft, setLiveSecondsLeft] = useState(0);
+  const liveCountdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [messagesSent, setMessagesSent] = useState(0);
   const sessionRef = useRef<any>(null);
   const recorderRef = useRef<AudioRecorder | null>(null);
   const playerRef = useRef<AudioPlayer | null>(null);
+  const liveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const chatRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -207,15 +224,35 @@ export default function App() {
     if (rejected > 0) {
       setError(`${rejected} archivo(s) no soportado(s) fueron ignorados.`);
     }
-    setAttachedFiles((prev) => [...prev, ...valid]);
-    valid.forEach((f) => {
-      if (f.type.startsWith('image/')) {
-        const reader = new FileReader();
-        reader.onload = () => setFilePreviews((prev) => [...prev, reader.result as string]);
-        reader.readAsDataURL(f);
-      } else {
-        setFilePreviews((prev) => [...prev, '']);
+    // Check file size limit
+    const tooBig = valid.filter((f) => f.size > MAX_FILE_SIZE_MB * 1024 * 1024);
+    if (tooBig.length > 0) {
+      setError(`Archivo(s) demasiado grande(s) (máx ${MAX_FILE_SIZE_MB}MB): ${tooBig.map((f) => f.name).join(', ')}`);
+      const withinSize = valid.filter((f) => f.size <= MAX_FILE_SIZE_MB * 1024 * 1024);
+      if (withinSize.length === 0) return;
+    }
+    const withinSize = valid.filter((f) => f.size <= MAX_FILE_SIZE_MB * 1024 * 1024);
+    // Check max files limit
+    setAttachedFiles((prev) => {
+      const space = MAX_FILES_PER_MESSAGE - prev.length;
+      if (space <= 0) {
+        setError(`Máximo ${MAX_FILES_PER_MESSAGE} archivos por mensaje.`);
+        return prev;
       }
+      const toAdd = withinSize.slice(0, space);
+      if (toAdd.length < withinSize.length) {
+        setError(`Solo se pueden adjuntar ${MAX_FILES_PER_MESSAGE} archivos. Se ignoraron los extras.`);
+      }
+      toAdd.forEach((f) => {
+        if (f.type.startsWith('image/')) {
+          const reader = new FileReader();
+          reader.onload = () => setFilePreviews((prev) => [...prev, reader.result as string]);
+          reader.readAsDataURL(f);
+        } else {
+          setFilePreviews((prev) => [...prev, '']);
+        }
+      });
+      return [...prev, ...toAdd];
     });
   }, []);
 
@@ -235,10 +272,15 @@ export default function App() {
   };
 
   const sendMessage = async () => {
-    const text = input.trim();
+    const text = input.trim().slice(0, MAX_INPUT_CHARS);
     if (!text && attachedFiles.length === 0) return;
+    if (messagesSent >= MAX_MESSAGES_PER_SESSION) {
+      setError(`Límite de ${MAX_MESSAGES_PER_SESSION} mensajes alcanzado. Recarga la página para iniciar una nueva sesión.`);
+      return;
+    }
 
     setError(null);
+    setMessagesSent((prev) => prev + 1);
     const userMsg: Message = {
       role: 'user',
       text: text || (attachedFiles.length > 0 ? 'Analiza este archivo' : ''),
@@ -271,6 +313,11 @@ export default function App() {
       }
 
       historyRef.current.push({ role: 'user', parts });
+
+      // Trim history to last N turns to control token usage
+      if (historyRef.current.length > MAX_HISTORY_TURNS) {
+        historyRef.current = historyRef.current.slice(-MAX_HISTORY_TURNS);
+      }
 
       if (wantsQuiz) {
         // Use structured output for guaranteed valid quiz JSON
@@ -374,19 +421,47 @@ export default function App() {
     return lines.join('\n');
   };
 
-  // Audio
-  const connectingRef = useRef(false);
+  // Audio — single-session guard
+  const liveStateRef = useRef<'idle' | 'connecting' | 'connected' | 'disconnecting'>('idle');
+
+  const cleanupLive = () => {
+    if (liveTimeoutRef.current) { clearTimeout(liveTimeoutRef.current); liveTimeoutRef.current = null; }
+    if (liveCountdownRef.current) { clearInterval(liveCountdownRef.current); liveCountdownRef.current = null; }
+    setLiveSecondsLeft(0);
+    recorderRef.current?.stop();
+    recorderRef.current = null;
+    playerRef.current?.stop();
+    playerRef.current = null;
+    setIsConnected(false);
+    setIsConnecting(false);
+  };
+
+  const disconnect = useCallback(() => {
+    if (liveStateRef.current === 'idle' || liveStateRef.current === 'disconnecting') return;
+    liveStateRef.current = 'disconnecting';
+
+    cleanupLive();
+
+    const pending = sessionRef.current;
+    sessionRef.current = null;
+    if (pending) {
+      pending.then((s: any) => { try { s.close(); } catch {} }).catch(() => {});
+    }
+
+    liveStateRef.current = 'idle';
+  }, []);
+
   const connect = async () => {
-    if (connectingRef.current) return; // prevent double-click
-    connectingRef.current = true;
-    // Tear down any existing session first to prevent overlapping calls
-    await disconnectAsync();
+    // Only allow connect from idle state
+    if (liveStateRef.current !== 'idle') return;
+    liveStateRef.current = 'connecting';
 
     setIsConnecting(true);
     setError(null);
     try {
-      playerRef.current = new AudioPlayer();
-      playerRef.current.init();
+      const player = new AudioPlayer();
+      player.init();
+      playerRef.current = player;
 
       const contextSummary = buildConversationContext();
 
@@ -394,10 +469,22 @@ export default function App() {
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         callbacks: {
           onopen: () => {
+            // Guard: if we disconnected while connecting, abort
+            if (liveStateRef.current !== 'connecting') return;
+            liveStateRef.current = 'connected';
+
             setIsConnected(true);
             setIsConnecting(false);
-            connectingRef.current = false;
+
+            // Auto-disconnect countdown
+            setLiveSecondsLeft(Math.floor(LIVE_SESSION_TIMEOUT_MS / 1000));
+            liveCountdownRef.current = setInterval(() => {
+              setLiveSecondsLeft((prev) => (prev <= 1 ? 0 : prev - 1));
+            }, 1000);
+            liveTimeoutRef.current = setTimeout(() => disconnect(), LIVE_SESSION_TIMEOUT_MS);
+
             recorderRef.current = new AudioRecorder((base64Data) => {
+              if (liveStateRef.current !== 'connected') return;
               sessionPromise.then((session) => {
                 session.sendRealtimeInput({
                   audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
@@ -406,7 +493,8 @@ export default function App() {
             });
             recorderRef.current.start();
           },
-          onmessage: async (message: LiveServerMessage) => {
+          onmessage: (message: LiveServerMessage) => {
+            if (liveStateRef.current !== 'connected') return;
             const audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (audio && playerRef.current) playerRef.current.play(audio);
             if (message.serverContent?.interrupted && playerRef.current) {
@@ -432,32 +520,9 @@ export default function App() {
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'No se pudo conectar el audio.');
-      setIsConnecting(false);
-      connectingRef.current = false;
+      cleanupLive();
+      liveStateRef.current = 'idle';
     }
-  };
-
-  const disconnectAsync = async () => {
-    recorderRef.current?.stop();
-    recorderRef.current = null;
-    playerRef.current?.stop();
-    playerRef.current = null;
-    if (sessionRef.current) {
-      try {
-        const session = await sessionRef.current;
-        session.close();
-      } catch {
-        // session may already be closed
-      }
-      sessionRef.current = null;
-    }
-    setIsConnected(false);
-    setIsConnecting(false);
-    connectingRef.current = false;
-  };
-
-  const disconnect = () => {
-    disconnectAsync();
   };
 
   // Drag & drop
@@ -849,6 +914,13 @@ export default function App() {
             <PhoneOff className="w-5 h-5 text-white" />
           )}
         </button>
+        <button
+          onClick={onLogout}
+          className="w-10 h-10 rounded-full bg-stone-100 hover:bg-stone-200 flex items-center justify-center transition-colors"
+          title="Cerrar sesión"
+        >
+          <LogOut className="w-4 h-4 text-stone-500" />
+        </button>
       </header>
 
       {/* Topic picker */}
@@ -990,7 +1062,10 @@ export default function App() {
       {isConnected && (
         <div className="mx-4 mb-2 bg-rose-50 text-rose-600 px-3 py-2 rounded-lg text-sm flex items-center gap-2">
           <Phone className="w-4 h-4 animate-pulse" />
-          <span className="font-medium">En llamada — Claudia te está escuchando...</span>
+          <span className="font-medium">En llamada con Claudia</span>
+          <span className={`font-mono text-xs px-2 py-0.5 rounded-full ${liveSecondsLeft <= 30 ? 'bg-red-100 text-red-600' : 'bg-rose-100 text-rose-500'}`}>
+            {Math.floor(liveSecondsLeft / 60)}:{(liveSecondsLeft % 60).toString().padStart(2, '0')}
+          </span>
           <button onClick={disconnect} className="ml-auto text-rose-400 hover:text-rose-600">
             <X className="w-4 h-4" />
           </button>
@@ -1042,22 +1117,37 @@ export default function App() {
               e.target.value = '';
             }}
           />
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Escribe tu pregunta o pide un test..."
-            rows={1}
-            className="flex-1 resize-none rounded-2xl border border-stone-200 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-rose-300 focus:border-transparent max-h-32"
-            style={{ minHeight: '42px' }}
-          />
+          <div className="flex-1 relative">
+            <textarea
+              value={input}
+              onChange={(e) => {
+                if (e.target.value.length <= MAX_INPUT_CHARS) setInput(e.target.value);
+              }}
+              onKeyDown={handleKeyDown}
+              placeholder="Escribe tu pregunta o pide un test..."
+              rows={1}
+              maxLength={MAX_INPUT_CHARS}
+              className="w-full resize-none rounded-2xl border border-stone-200 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-rose-300 focus:border-transparent max-h-32"
+              style={{ minHeight: '42px' }}
+            />
+            {input.length > MAX_INPUT_CHARS * 0.8 && (
+              <span className={`absolute right-3 bottom-1 text-[10px] ${input.length >= MAX_INPUT_CHARS ? 'text-red-500' : 'text-stone-400'}`}>
+                {input.length}/{MAX_INPUT_CHARS}
+              </span>
+            )}
+          </div>
           <button
             onClick={sendMessage}
-            disabled={isLoading || (!input.trim() && attachedFiles.length === 0)}
+            disabled={isLoading || (!input.trim() && attachedFiles.length === 0) || messagesSent >= MAX_MESSAGES_PER_SESSION}
             className="w-10 h-10 rounded-full bg-rose-600 hover:bg-rose-700 disabled:bg-stone-300 flex items-center justify-center shrink-0 transition-colors"
           >
             <Send className="w-5 h-5 text-white" />
           </button>
+        </div>
+        <div className="flex justify-center mt-1">
+          <span className={`text-[10px] ${(MAX_MESSAGES_PER_SESSION - messagesSent) <= 5 ? 'text-red-400' : 'text-stone-400'}`}>
+            {MAX_MESSAGES_PER_SESSION - messagesSent} mensajes restantes
+          </span>
         </div>
       </div>
     </div>
