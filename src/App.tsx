@@ -375,7 +375,13 @@ export default function App() {
   };
 
   // Audio
+  const connectingRef = useRef(false);
   const connect = async () => {
+    if (connectingRef.current) return; // prevent double-click
+    connectingRef.current = true;
+    // Tear down any existing session first to prevent overlapping calls
+    await disconnectAsync();
+
     setIsConnecting(true);
     setError(null);
     try {
@@ -390,6 +396,7 @@ export default function App() {
           onopen: () => {
             setIsConnected(true);
             setIsConnecting(false);
+            connectingRef.current = false;
             recorderRef.current = new AudioRecorder((base64Data) => {
               sessionPromise.then((session) => {
                 session.sendRealtimeInput({
@@ -426,20 +433,31 @@ export default function App() {
       console.error(err);
       setError(err.message || 'No se pudo conectar el audio.');
       setIsConnecting(false);
+      connectingRef.current = false;
     }
   };
 
-  const disconnect = () => {
+  const disconnectAsync = async () => {
     recorderRef.current?.stop();
     recorderRef.current = null;
     playerRef.current?.stop();
     playerRef.current = null;
     if (sessionRef.current) {
-      sessionRef.current.then((s: any) => s.close());
+      try {
+        const session = await sessionRef.current;
+        session.close();
+      } catch {
+        // session may already be closed
+      }
       sessionRef.current = null;
     }
     setIsConnected(false);
     setIsConnecting(false);
+    connectingRef.current = false;
+  };
+
+  const disconnect = () => {
+    disconnectAsync();
   };
 
   // Drag & drop
