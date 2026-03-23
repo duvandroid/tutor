@@ -1,0 +1,5 @@
+{
+  "name": "Tutor de Histología",
+  "description": "Una aplicación interactiva de voz para aprender sobre tejido epitelial, conectivo y glándulas usando Gemini Live.",
+  "requestFramePermissions": ["microphone"]
+}
